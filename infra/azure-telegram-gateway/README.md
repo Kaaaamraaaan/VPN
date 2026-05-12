@@ -7,6 +7,8 @@ This Terraform module deploys a small Ubuntu VM in Azure and configures:
 
 Use this only where it is legal for you to operate a VPN/proxy and where it complies with Azure's terms. Networks with heavy filtering may still block Azure IP ranges, WireGuard UDP, or proxy traffic; this module does not guarantee connectivity in any specific country.
 
+The generated WireGuard profile routes both IPv4 and IPv6 into the tunnel. The VM provides IPv4 internet egress by default; IPv6 traffic is kept inside the tunnel to avoid client-side IPv6 bypasses unless you extend the Azure deployment with public IPv6 egress.
+
 ## Prerequisites
 
 - Azure CLI authenticated with `az login`.
