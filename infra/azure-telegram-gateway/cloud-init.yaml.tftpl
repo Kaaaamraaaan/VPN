@@ -1,0 +1,171 @@
+#cloud-config
+package_update: true
+package_upgrade: false
+packages:
+  - dante-server
+  - openssl
+  - qrencode
+  - wireguard
+
+write_files:
+  - path: /usr/local/sbin/configure-privacy-gateway
+    owner: root:root
+    permissions: '0755'
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+
+      PUBLIC_IP="${public_ip}"
+      WG_PORT="${wireguard_port}"
+      WG_CLIENT_NAME="${wireguard_client_name}"
+      SOCKS_PORT="${telegram_socks_port}"
+      SOCKS_USER="${telegram_socks_username}"
+      REQUESTED_SOCKS_PASSWORD_B64="${telegram_socks_password_b64}"
+
+      OUT_DIR="/opt/privacy-gateway"
+      WG_OUT_DIR="$OUT_DIR/wireguard"
+      DEFAULT_IFACE="$(ip route show default | awk '{print $5; exit}')"
+
+      install -d -m 700 "$OUT_DIR" "$WG_OUT_DIR" /etc/wireguard
+      chmod 700 /etc/wireguard
+
+      cat >/etc/sysctl.d/99-privacy-gateway.conf <<'SYSCTL'
+      net.ipv4.ip_forward=1
+      net.ipv6.conf.all.forwarding=1
+      SYSCTL
+      sysctl --system
+
+      SERVER_PRIVATE_KEY_FILE="/etc/wireguard/server_private.key"
+      CLIENT_PRIVATE_KEY_FILE="/etc/wireguard/$WG_CLIENT_NAME.private.key"
+      PRESHARED_KEY_FILE="/etc/wireguard/$WG_CLIENT_NAME.preshared.key"
+
+      if [ ! -s "$SERVER_PRIVATE_KEY_FILE" ]; then
+        wg genkey >"$SERVER_PRIVATE_KEY_FILE"
+      fi
+
+      if [ ! -s "$CLIENT_PRIVATE_KEY_FILE" ]; then
+        wg genkey >"$CLIENT_PRIVATE_KEY_FILE"
+      fi
+
+      if [ ! -s "$PRESHARED_KEY_FILE" ]; then
+        wg genpsk >"$PRESHARED_KEY_FILE"
+      fi
+
+      chmod 600 "$SERVER_PRIVATE_KEY_FILE" "$CLIENT_PRIVATE_KEY_FILE" "$PRESHARED_KEY_FILE"
+
+      SERVER_PRIVATE_KEY="$(cat "$SERVER_PRIVATE_KEY_FILE")"
+      SERVER_PUBLIC_KEY="$(printf '%s' "$SERVER_PRIVATE_KEY" | wg pubkey)"
+      CLIENT_PRIVATE_KEY="$(cat "$CLIENT_PRIVATE_KEY_FILE")"
+      CLIENT_PUBLIC_KEY="$(printf '%s' "$CLIENT_PRIVATE_KEY" | wg pubkey)"
+      PRESHARED_KEY="$(cat "$PRESHARED_KEY_FILE")"
+
+      cat >/etc/wireguard/wg0.conf <<WGCONF
+      [Interface]
+      Address = 10.8.0.1/24, fd42:42:42::1/64
+      ListenPort = $WG_PORT
+      PrivateKey = $SERVER_PRIVATE_KEY
+      PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o $DEFAULT_IFACE -j ACCEPT; iptables -t nat -A POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
+      PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o $DEFAULT_IFACE -j ACCEPT; iptables -t nat -D POSTROUTING -o $DEFAULT_IFACE -j MASQUERADE
+
+      [Peer]
+      PublicKey = $CLIENT_PUBLIC_KEY
+      PresharedKey = $PRESHARED_KEY
+      AllowedIPs = 10.8.0.2/32, fd42:42:42::2/128
+      WGCONF
+      chmod 600 /etc/wireguard/wg0.conf
+
+      CLIENT_CONFIG="$WG_OUT_DIR/$WG_CLIENT_NAME.conf"
+      cat >"$CLIENT_CONFIG" <<CLIENTCONF
+      [Interface]
+      PrivateKey = $CLIENT_PRIVATE_KEY
+      Address = 10.8.0.2/32, fd42:42:42::2/128
+      DNS = 1.1.1.1, 9.9.9.9
+
+      [Peer]
+      PublicKey = $SERVER_PUBLIC_KEY
+      PresharedKey = $PRESHARED_KEY
+      Endpoint = $PUBLIC_IP:$WG_PORT
+      AllowedIPs = 0.0.0.0/0, ::/0
+      PersistentKeepalive = 25
+      CLIENTCONF
+      chmod 600 "$CLIENT_CONFIG"
+      qrencode -t png -o "$CLIENT_CONFIG.png" <"$CLIENT_CONFIG"
+      chmod 600 "$CLIENT_CONFIG.png"
+
+      systemctl enable wg-quick@wg0
+      if systemctl is-active --quiet wg-quick@wg0; then
+        systemctl restart wg-quick@wg0
+      else
+        systemctl start wg-quick@wg0
+      fi
+
+      SOCKS_ENV="$OUT_DIR/telegram-socks.env"
+      if [ -s "$SOCKS_ENV" ]; then
+        # shellcheck disable=SC1090
+        source "$SOCKS_ENV"
+      else
+        if [ -n "$REQUESTED_SOCKS_PASSWORD_B64" ]; then
+          TELEGRAM_SOCKS_PASSWORD="$(printf '%s' "$REQUESTED_SOCKS_PASSWORD_B64" | base64 -d)"
+        else
+          TELEGRAM_SOCKS_PASSWORD="$(openssl rand -hex 18)"
+        fi
+        printf 'TELEGRAM_SOCKS_PASSWORD=%q\n' "$TELEGRAM_SOCKS_PASSWORD" >"$SOCKS_ENV"
+        chmod 600 "$SOCKS_ENV"
+      fi
+
+      if ! id "$SOCKS_USER" >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$SOCKS_USER"
+      fi
+      printf '%s:%s\n' "$SOCKS_USER" "$TELEGRAM_SOCKS_PASSWORD" | chpasswd
+
+      cat >/etc/danted.conf <<DANTED
+      logoutput: syslog
+      internal: 0.0.0.0 port = $SOCKS_PORT
+      external: $DEFAULT_IFACE
+      clientmethod: none
+      socksmethod: username
+      user.privileged: root
+      user.unprivileged: nobody
+      user.libwrap: nobody
+
+      client pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        log: connect disconnect error
+      }
+
+      socks pass {
+        from: 0.0.0.0/0 to: 0.0.0.0/0
+        command: bind connect udpassociate
+        log: connect disconnect error
+        socksmethod: username
+      }
+      DANTED
+
+      systemctl enable danted
+      systemctl restart danted
+
+      cat >"$OUT_DIR/telegram-socks.txt" <<INFO
+      Telegram SOCKS5 proxy
+      Server: $PUBLIC_IP
+      Port: $SOCKS_PORT
+      Username: $SOCKS_USER
+      Password: $TELEGRAM_SOCKS_PASSWORD
+
+      Telegram link:
+      https://t.me/socks?server=$PUBLIC_IP&port=$SOCKS_PORT&user=$SOCKS_USER&pass=$TELEGRAM_SOCKS_PASSWORD
+      INFO
+      chmod 600 "$OUT_DIR/telegram-socks.txt"
+
+      cat >"$OUT_DIR/README.txt" <<INFO
+      Generated files:
+        - WireGuard client: $CLIENT_CONFIG
+        - WireGuard QR PNG: $CLIENT_CONFIG.png
+        - Telegram SOCKS5 settings: $OUT_DIR/telegram-socks.txt
+
+      Run this command to render a terminal QR code for the WireGuard client:
+        sudo qrencode -t ansiutf8 < $CLIENT_CONFIG
+      INFO
+      chmod 600 "$OUT_DIR/README.txt"
+
+runcmd:
+  - [bash, /usr/local/sbin/configure-privacy-gateway]
